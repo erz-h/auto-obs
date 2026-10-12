@@ -1,6 +1,0 @@
-.env
-station_me48.db
-__pycache__/
-*.pyc
-.venv/
-venv/
