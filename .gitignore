@@ -1,0 +1,12 @@
+# Sensitive environment variables
+.env
+
+# Local SQLite Database
+station_me48.db
+*.db
+
+# Python cached files & virtual environments
+__pycache__/
+*.pyc
+.venv/
+venv/
