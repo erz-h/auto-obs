@@ -43,6 +43,70 @@ DIGI_FLAG_KEYS = [
     "pressure_qfe_mb_derived_digi_flag",
 ]
 
+# --- HELPER FUNCTIONS ---
+def extract_bmkg_synop(response_json):
+  """Robustly extracts the server-generated SYNOP string from BMKGSoft API responses."""
+  if not response_json or not isinstance(response_json, dict):
+    return ""
+
+  # 1. Direct key checks
+  data_block = response_json.get("data")
+  if isinstance(data_block, dict):
+    if data_block.get("encoded_synop"):
+      return data_block["encoded_synop"]
+
+    manual = data_block.get("manual_entry")
+    if isinstance(manual, dict):
+      if manual.get("edited_encoded_synop"):
+        return manual["edited_encoded_synop"]
+      if manual.get("encoded_synop"):
+        return manual["encoded_synop"]
+
+  # 2. Recursive fallback search for any string containing 'AAXX'
+  def deep_search(obj):
+    if isinstance(obj, dict):
+      for val in obj.values():
+        res = deep_search(val)
+        if res:
+          return res
+    elif isinstance(obj, list):
+      for item in obj:
+        res = deep_search(item)
+        if res:
+          return res
+    elif isinstance(obj, str) and ("AAXX" in obj or "SIID" in obj or "SMID" in obj):
+      return obj
+    return ""
+
+  return deep_search(response_json)
+
+
+def get_bmkg_preview_synop(headers, payload, iso_utc_timestamp):
+  """Calls BMKGSoft /entry/preview endpoint using the station and date URL parameters."""
+  preview_url = f"{BASE_URL}/sinoptik/entry/preview/station/{STATION_ID}/date/{iso_utc_timestamp}"
+
+  try:
+    res = requests.post(preview_url, json=payload, headers=headers, timeout=10)
+    try:
+      res_json = res.json()
+    except Exception:
+      res_json = {"raw_response": res.text}
+
+    if res.status_code in [200, 201]:
+      data_block = res_json.get("data", {})
+      synop = ""
+      if isinstance(data_block, dict):
+        synop = data_block.get("encoded_synop") or ""
+        if not synop:
+          manual = data_block.get("manual_entry", {})
+          if isinstance(manual, dict):
+            synop = manual.get("edited_encoded_synop") or ""
+      return synop, res_json, res.status_code
+    else:
+      return "", res_json, res.status_code
+
+  except Exception as err:
+    return "", {"error": str(err)}, 0
 
 # --- LOCAL DATABASE FUNCTIONS ---
 def save_local_observation(payload, synop_code):
@@ -202,10 +266,12 @@ with st.form("me48_entry_form"):
 
   st.subheader("4. Encoded SYNOP String")
   synop_text = st.text_area(
-      "SYNOP Code",
-      value=(
-          "SIID73 WAGB 071500\nAAXX 07154\n96595 31/01 /0000 10266 20248 30090"
-          " 40136 51011 70444\n  333 56999="
+      "AAXX SYNOP Code (Optional / Auto-captured on submit)",
+      value=st.session_state.get("last_captured_synop", ""),
+      height=100,
+      help=(
+          "Leave blank or enter manually. BMKGSoft will auto-generate and save"
+          " the official AAXX string when you submit."
       ),
   )
 
@@ -297,32 +363,52 @@ if submit_btn:
       "pressure_qfe_mb_derived": qfe,
   }
 
-  save_local_observation(full_payload, synop_text)
-  st.info("Observation recorded locally in SQLite (`station_me48.db`).")
+  for flag in DIGI_FLAG_KEYS:
+    full_payload[flag] = False
 
   try:
+    # STEP 1: Fetch server-generated SYNOP string from the official preview route
+    st.text("Generating official AAXX SYNOP string from BMKGSoft preview...")
+    generated_synop, preview_json, preview_status = get_bmkg_preview_synop(
+        headers, full_payload, iso_utc_timestamp
+    )
+
+    with st.expander(
+        f"🔍 BMKGSoft Preview API Response (Status: {preview_status})",
+        expanded=True,
+    ):
+      st.json(preview_json)
+
+    final_synop = generated_synop if generated_synop else synop_text
+
+    # STEP 2: Send GTS Broadcast for primary hours
     if hour_int in PRIMARY_SYNOP_HOURS:
-      st.text("Primary Synoptic Hour detected. Sending GTS broadcast...")
-      gts_url = f"{BASE_URL}/gts/entry"
-      gts_payload = {"sandi": synop_text, "only_save": False}
-      gts_res = requests.post(gts_url, json=gts_payload, headers=headers)
-
-      if gts_res.status_code in [200, 201]:
-        st.success("GTS Broadcast Successful (200 OK).")
-      else:
-        st.error(
-            f"GTS Broadcast Failed ({gts_res.status_code}): {gts_res.text}"
+      if final_synop:
+        st.text(
+            f"Primary Synoptic Hour ({hour_int:02d}:00 UTC) detected."
+            " Broadcasting SYNOP to GTS..."
         )
+        gts_url = f"{BASE_URL}/gts/entry"
+        gts_payload = {"sandi": final_synop, "only_save": False}
+        gts_res = requests.post(gts_url, json=gts_payload, headers=headers)
 
-    st.text("Executing observation submission to BMKGSoft...")
+        if gts_res.status_code in [200, 201]:
+          st.success("GTS Broadcast Successful (200 OK).")
+        else:
+          st.error(
+              f"GTS Broadcast Failed ({gts_res.status_code}): {gts_res.text}"
+          )
+      else:
+        st.warning("Primary hour detected, but no SYNOP code was generated.")
+
+    # STEP 3: Submit observation entry form to BMKGSoft
+    st.text("Submitting observation entry to BMKGSoft...")
     submit_url = (
         f"{BASE_URL}/sinoptik/entry/station/{STATION_ID}/date/{iso_utc_timestamp}"
     )
 
     final_payload = full_payload.copy()
-    final_payload["edited_encoded_synop"] = synop_text
-    for flag in DIGI_FLAG_KEYS:
-      final_payload[flag] = False
+    final_payload["edited_encoded_synop"] = final_synop
 
     if hour_int in PRIMARY_SYNOP_HOURS:
       submit_res = requests.put(
@@ -337,21 +423,29 @@ if submit_btn:
             submit_url, json=final_payload, headers=headers
         )
 
+    # STEP 4: Save locally & display status
     if submit_res.status_code in [200, 201]:
+      save_local_observation(full_payload, final_synop)
       set_synced_status(iso_utc_timestamp)
+
       st.balloons()
       st.success(
           f"Successfully submitted for {selected_observer} (ID: {OBSERVER_ID})"
           f" to BMKGSoft (`{iso_utc_timestamp}`)!"
       )
+      if final_synop:
+        st.subheader("Official Captured SYNOP String:")
+        st.code(final_synop, language="text")
     else:
+      save_local_observation(full_payload, final_synop)
       st.warning(
-          "Saved locally, but submission to BMKGSoft returned status"
+          "Saved locally to SQLite, but BMKGSoft returned status"
           f" {submit_res.status_code}: {submit_res.text}"
       )
 
   except Exception as err:
+    save_local_observation(full_payload, synop_text)
     st.error(
-        f"Network Connection Exception: {err}. Entry saved safely in local"
-        " station database."
+        f"Network Exception: {err}. Entry saved safely in local station database"
+        " (`station_me48.db`)."
     )
