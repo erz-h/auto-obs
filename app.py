@@ -1,10 +1,11 @@
 import os
 import sqlite3
 from datetime import datetime, timezone
-from auth import get_bmkg_credentials
 from dotenv import load_dotenv
 import requests
 import streamlit as st
+from auth import get_bmkg_credentials
+from metar import convert_synop_to_metar_peraturan
 
 # Load credentials from .env
 load_dotenv()
@@ -17,6 +18,7 @@ st.title("Station ME 48 Observation & BMKGSoft Sync")
 # --- STATION CONFIGURATION ---
 BASE_URL = "https://bmkgsatu.bmkg.go.id/api/v21"
 STATION_ID = 54  # WAGB / Station 96595
+PRIMARY_SYNOP_HOURS = [0, 3, 6, 9, 12, 15, 18, 21]
 
 # Station Observer Roster
 OBSERVER_ROSTER = {
@@ -26,7 +28,8 @@ OBSERVER_ROSTER = {
     "Other / Custom ID": None,
 }
 
-PRIMARY_SYNOP_HOURS = {0, 3, 6, 9, 12, 15, 18, 21}
+# Alias for compatibility with form sections
+OBSERVER_DICT = OBSERVER_ROSTER
 
 DIGI_FLAG_KEYS = [
     "wind_dir_deg_dd_digi_flag",
@@ -217,66 +220,324 @@ CF_CLEARANCE = st.sidebar.text_input(
 
 
 # --- ENTRY FORM ---
-with st.form("me48_entry_form"):
-  st.subheader("1. Date, Time & Observer (UTC)")
-  col_t1, col_t2, col_t3 = st.columns(3)
-  with col_t1:
-    obs_date = st.date_input("Observation Date UTC")
-  with col_t2:
-    obs_hour = st.selectbox(
-        "Observation Hour UTC",
-        options=[f"{h:02d}:00" for h in range(24)],
-        index=15,
-    )
-  with col_t3:
-    selected_observer = st.selectbox(
-        "Duty Observer Name", options=list(OBSERVER_ROSTER.keys())
-    )
-    if selected_observer == "Other / Custom ID":
-      OBSERVER_ID = st.number_input("Enter BMKG Observer ID", value=5882, step=1)
-    else:
-      OBSERVER_ID = OBSERVER_ROSTER[selected_observer]
+st.subheader("1. Date, Time & Observer (UTC)")
+col_t1, col_t2, col_t3 = st.columns(3)
+with col_t1:
+  obs_date = st.date_input("Tanggal Pengamatan", value=datetime.utcnow())
+with col_t2:
+  utc_hours = [f"{h:02d}:00" for h in range(24)]
+  current_utc_hour = datetime.now(timezone.utc).hour
+  obs_hour = st.selectbox(
+      "Jam Pengamatan (UTC)",
+      options=utc_hours,
+      index=current_utc_hour,
+  )
+with col_t3:
+  selected_observer = st.selectbox(
+      "Pengamat", options=list(OBSERVER_ROSTER.keys())
+  )
+  raw_id = OBSERVER_ROSTER[selected_observer]
+  if raw_id is None:
+    OBSERVER_ID = st.number_input("Masukkan Observer ID", value=None, step=1)
+  else:
+    OBSERVER_ID = raw_id
 
-  st.subheader("2. Temperatures & Pressure")
-  col1, col2 = st.columns(2)
-  with col1:
-    temp_dry = st.number_input("Dry Bulb (°C)", value=26.6, step=0.1)
-    temp_wet = st.number_input("Wet Bulb (°C)", value=25.3, step=0.1)
-    temp_max = st.number_input("Max Temp (°C)", value=None)
-    temp_min = st.number_input("Min Temp (°C)", value=None)
-  with col2:
-    qff = st.number_input("QFF Pressure (hPa)", value=1013.6, step=0.1)
-    qfe = st.number_input("QFE Pressure (hPa)", value=1009.0, step=0.1)
-    rainfall = st.number_input("Rainfall (mm)", value=0.0, step=0.1)
+st.subheader("2. Angin, Cuaca, Tekanan & Suhu")
+col_angin, col_cuaca, col_tekanan, col_suhu = st.columns(4)
 
-  st.subheader("3. Wind, Weather & Clouds")
-  col3, col4 = st.columns(2)
-  with col3:
-    wind_dir = st.number_input("Wind Direction (degrees)", value=0, step=10)
-    wind_speed = st.number_input("Wind Speed (knots)", value=0, step=1)
-    visibility = st.number_input("Visibility (km)", value=0.1, step=0.1)
-    ww = st.number_input("Present Weather (ww)", value=4, step=1)
-    w1 = st.text_input("Past Weather (W1)", value="4")
-    w2 = st.text_input("Past Weather (W2)", value="4")
-  with col4:
-    cloud_m = st.text_input("Total Cloud Cover (oktas)", value="/")
-    cloud_cl = st.text_input("Low Cloud (CL)", value="/")
-    cloud_cm = st.text_input("Medium Cloud (CM)", value="/")
-    cloud_ch = st.text_input("High Cloud (CH)", value="/")
-
-  st.subheader("4. Encoded SYNOP String")
-  synop_text = st.text_area(
-      "AAXX SYNOP Code (Optional / Auto-captured on submit)",
-      value=st.session_state.get("last_captured_synop", ""),
-      height=100,
-      help=(
-          "Leave blank or enter manually. BMKGSoft will auto-generate and save"
-          " the official AAXX string when you submit."
-      ),
+with col_angin:
+  st.markdown("`ANGIN`")
+  wind_indicator_iw = st.selectbox(
+      "Pengenal Data Angin (iw)", options=[4, 1, 0, 3], index=0
+  )
+  wind_dir = st.number_input(
+      "Arah Angin (derajat)", min_value=0, max_value=360, value=None
+  )
+  wind_speed = st.number_input(
+      "Kecepatan Angin (knot)", min_value=0, value=None
+  )
+  st.write("")
+  visibility = st.number_input(
+      "Jarak penglihatan mendatar (km)",
+      min_value=0.0,
+      value=None,
+      format="%.1f",
   )
 
-  submit_btn = st.form_submit_button("Save Locally & Push to BMKGSoft")
+with col_cuaca:
+  st.markdown("`CUACA`")
+  weather_indicator_ix = st.text_input(
+      "Pengenal Data Cuaca (ix)", value=None, disabled=True
+  )
+  ww = st.number_input("Cuaca Saat Pengamatan (ww)", value=None, min_value=0)
+  w1 = st.selectbox(
+      "Cuaca yang lalu (W1)",
+      options=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+      index=None,
+  )
+  w2 = st.selectbox(
+      "Cuaca yang lalu (W2)",
+      options=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+      index=None,
+  )
+  st.caption("`IR = 4`")
 
+with col_tekanan:
+  st.markdown("`TEKANAN`")
+  st.caption("🔵 **Barometer Air Raksa**")
+  pressure_temp = st.text_input(
+      "Derajat Panas (°C)", value=None, disabled=True, placeholder="N/A"
+  )
+  pressure_reading = st.text_input(
+      "Tekanan dibaca (mb)", value=None, disabled=True, placeholder="N/A"
+  )
+  st.caption("🔵 **Barometer Digital**")
+  qff = st.number_input("Tekanan QFF", value=None, format="%.1f")
+  qfe = st.number_input("Tekanan QFE", value=None, format="%.1f")
+
+with col_suhu:
+  st.markdown("`SUHU`")
+  temp_dry = st.number_input(
+      "Suhu Bola Kering (°C)", value=None, format="%.1f"
+  )
+  temp_wet = st.number_input(
+      "Suhu Bola Basah (°C)", value=None, format="%.1f"
+  )
+  temp_max = st.number_input(
+      "Suhu Maksimum (°C)", value=None, placeholder="Opsional"
+  )
+  temp_min = st.number_input(
+      "Suhu Minimum (°C)", value=None, placeholder="Opsional"
+  )
+
+# --------------------------------------------------------------------------
+# SEKSI 3: WEATHER & DETAILED CLOUD OBSERVATION
+# --------------------------------------------------------------------------
+st.subheader("3. Weather & Detailed Cloud Observation")
+
+col_top1, col_top2, col_top3 = st.columns(3)
+with col_top1:
+  cloud_cover_oktas_m = st.selectbox(
+      "Bagian Langit Tertutup Awan (oktas)",
+      options=["/", "0", "1", "2", "3", "4", "5", "6", "7", "8"],
+      index=None,
+  )
+with col_top2:
+  rainfall_last_mm = st.number_input(
+      "Hujan takaran terakhir (mm)",
+      min_value=0.0,
+      value=None,
+      step=0.1,
+      placeholder="Kosong",
+  )
+with col_top3:
+  cloud_vertical_vis = st.number_input(
+      "Jarak Penglihatan Vertikal (m)", min_value=0, value=None, placeholder="Kosong"
+  )
+
+st.markdown("---")
+
+col_low, col_med, col_high = st.columns(3)
+
+# --- AWAN RENDAH ---
+CL_OPTIONS = {
+    None: "-- Pilih CL --",
+    0: "0 - tidak ada awan Cl",  #[cite: 50]
+    1: "1 - cumulus humilis atau fracto cumulus atau kedua-duanya",  #[cite: 50]
+    2: (
+        "2 - cumulus mediocris atau congestus, disertai atau tidak disertai"
+        " fractocumulus..."
+    ),  #[cite: 50]
+    3: (
+        "3 - cumulonimbus tanpa landasan, disertai atau tidak disertai cumulus,"
+        " stratocumulus..."
+    ),  #[cite: 50]
+    4: "4 - stratocumulus yang terjadi dari bentangan cumulus",  #[cite: 50]
+    5: "5 - stratocumulus yang tidak terjadi dari bentangan cumulus",  #[cite: 50]
+    6: "6 - stratus",  #
+    7: (
+        "7 - fraktostratus atau fraktocumulus yang menyertai cuaca buruk,"
+        " biasanya dibawah..."
+    ),  #[cite: 49]
+    8: (
+        "8 - cumulus dan stratocumulus yang tidak terjadi dari bentangan"
+        " cumulus, dengan..."
+    ),  #[cite: 49]
+    9: (
+        "9 - cumulonimbus, biasanya berlandasan disertai atau tidak disertai"
+        " cumulus..."
+    ),  #[cite: 49]
+    "/": (
+        "/ - Cl tidak kelihatan disebabkan oleh kabut, badai debu, badai pasir"
+        " atau lain-lain..."
+    ),  #[cite: 49]
+}
+
+LOW_CLOUD_GENUS = {
+    None: "",
+    6: "6 - stratocumulus (Sc)",
+    7: "7 - stratus (St)",
+    8: "8 - cumulus (Cu)",
+    9: "9 - cumulonimbus (Cb)",
+    "/": "/ - cloud not visible",
+}
+
+with col_low:
+  st.markdown("### ☁️ AWAN RENDAH")
+  cloud_low_type_cl = st.selectbox(
+    label="CL",
+    options=list(CL_OPTIONS.keys()),
+    format_func=lambda code: CL_OPTIONS[code],
+    index=0,
+  )
+  cloud_low_cover_oktas = st.selectbox(
+      "NCL", options=["/", "0", "1", "2", "3", "4", "5", "6", "7", "8"], index=None
+  )
+  
+  st.markdown("`Detail Utama (Layer 1)`")
+  cloud_low_type_1 = st.selectbox(
+    "Jenis (1)",
+    options=list(LOW_CLOUD_GENUS.keys()),
+    format_func=lambda code: LOW_CLOUD_GENUS[code],
+    index=0,
+)
+  cloud_low_cover_1 = st.text_input("Jumlah (1)", value=None)
+  cloud_low_base_1 = st.number_input("Tinggi Dasar (m) 1", value=None)
+  cloud_low_peak_1 = st.number_input("Tinggi Puncak (m) 1", value=None)
+  cloud_low_dir_1 = st.number_input("Arah Gerak 1", value=None)
+  cloud_elevation_angle_ec_1 = st.number_input("Sudut Elevasi 1", value=None)
+  cloud_low_dir_true_da_1 = st.number_input("Arah Sebenarnya 1", value=None)
+
+  with st.expander("➕ Tambah Layer (2)"):
+    st.caption("Layer 2")
+    cloud_low_type_2 = st.selectbox(
+      "Jenis (2)",
+      options=list(LOW_CLOUD_GENUS.keys()),
+      format_func=lambda code: LOW_CLOUD_GENUS[code],
+      index=0,
+    )
+    cloud_low_cover_2 = st.text_input("Jumlah (2)", value="")
+    cloud_low_base_2 = st.number_input("Tinggi Dasar (m) 2", value=None)
+    cloud_low_peak_2 = st.number_input("Tinggi Puncak (m) 2", value=None)
+    cloud_low_dir_2 = st.number_input("Arah Gerak 2", value=None)
+    cloud_elevation_angle_ec_2 = st.number_input("Sudut Elevasi 2", value=None)
+    cloud_low_dir_true_da_2 = st.number_input("Arah Sebenarnya 2", value=None)
+
+    with st.expander("➕ Tambah Layer (3)"):
+      st.caption("Layer 3")
+      cloud_low_type_3 = st.selectbox(
+        "Jenis (3)",
+        options=list(LOW_CLOUD_GENUS.keys()),
+        format_func=lambda code: LOW_CLOUD_GENUS[code],
+        index=0,
+      )
+      cloud_low_cover_3 = st.text_input("Jumlah (3)", value=None)
+      cloud_low_base_3 = st.number_input("Tinggi Dasar (m) 3", value=None)
+      cloud_low_dir_3 = st.number_input("Arah Gerak 3", value=None)
+
+# --- AWAN MENENGAH ---
+with col_med:
+  st.markdown("### ☁️ AWAN MENENGAH")
+  cloud_med_type_cm = st.selectbox(
+      "CM", options=["/", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], index=None
+  )
+  cloud_med_cover_oktas = st.selectbox(
+      "NCM", options=["/", "0", "1", "2", "3", "4", "5", "6", "7", "8"], index=None
+  )
+  
+  st.markdown("`Detail Utama (Layer 1)`")
+  cloud_med_type_1 = st.text_input("Jenis CM (1)", value=None)
+  cloud_med_cover_1 = st.text_input("Jumlah CM (1)", value=None)
+  cloud_med_base_1 = st.number_input("Tinggi Dasar CM (m) 1", value=None)
+  cloud_med_dir_1 = st.number_input("Arah CM 1", value=None)
+
+  with st.expander("➕ Tambah Layer (2)"):
+    st.caption("Layer 2")
+    cloud_med_type_2 = st.text_input("Jenis CM (2)", value=None)
+    cloud_med_cover_2 = st.text_input("Jumlah CM (2)", value=None)
+    cloud_med_base_2 = st.number_input("Tinggi Dasar CM (m) 2", value=None)
+    cloud_med_dir_2 = st.number_input("Arah CM 2", value=None)
+
+# --- AWAN TINGGI ---
+with col_high:
+  st.markdown("### ☁️ AWAN TINGGI")
+  cloud_high_type_ch = st.selectbox(
+      "CH", options=["/", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], index=None
+  )
+  cloud_high_cover_oktas = st.selectbox(
+      "NCH", options=["/", "0", "1", "2", "3", "4", "5", "6", "7", "8"], index=None
+  )
+  
+  st.markdown("`Detail Utama (Layer 1)`")
+  cloud_high_type_1 = st.text_input("Jenis CH (1)", value=None)
+  cloud_high_cover_1 = st.text_input("Jumlah CH (1)", value=None)
+  cloud_high_base_1 = st.number_input("Tinggi Dasar CH (m) 1", value=None)
+  cloud_high_dir_1 = st.number_input("Arah CH 1", value=None)
+
+  with st.expander("➕ Tambah Layer (2)"):
+    st.caption("Layer 2")
+    cloud_high_type_2 = st.text_input("Jenis CH (2)", value="")
+    cloud_high_cover_2 = st.text_input("Jumlah CH (2)", value="")
+    cloud_high_base_2 = st.number_input("Tinggi Dasar CH (m) 2", value=None)
+    cloud_high_dir_2 = st.number_input("Arah CH 2", value=None)
+
+# --------------------------------------------------------------------------
+# SEKSI 4: PENGUAPAN, MATAHARI & TANAH (Opsional)
+# --------------------------------------------------------------------------
+st.subheader("4. Penguapan, Matahari & Tanah")
+col_evap, col_sun, col_land = st.columns(3)
+
+with col_evap:
+  st.markdown("`PENGUAPAN`")
+  evaporation_24hours_mm_eee = st.number_input(
+      "Penguapan (mm)",
+      value=None,
+      min_value=0.0,
+      step=0.1,
+      placeholder="Opsional",
+  )
+  evaporation_eq_indicator_ie = st.selectbox(
+      "Pengenal Data Penguapan (iE)",
+      options=[None, 0, 1, 2, 3, 4],
+      index=0,
+      format_func=lambda x: "" if x is None else str(x),
+  )
+
+with col_sun:
+  st.markdown("`MATAHARI`")
+  solar_rad_24h_jcm2_f24 = st.number_input(
+      "Radiasi Matahari (Joule/cm2)",
+      value=None,
+      min_value=0.0,
+      placeholder="Opsional",
+  )
+  sunshine_h_sss = st.number_input(
+      "Lama Penyinaran Matahari (jam)",
+      value=None,
+      min_value=0.0,
+      max_value=24.0,
+      step=0.1,
+      placeholder="Opsional",
+  )
+
+with col_land:
+  st.markdown("`TANAH`")
+  land_cond = st.selectbox(
+      "Keadaan Tanah", options=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], index=None
+  )
+  land_note = st.text_input("Catatan", value="")
+
+# --------------------------------------------------------------------------
+# SEKSI 5: ENCODED SYNOP STRING
+# --------------------------------------------------------------------------
+st.subheader("5. Encoded SYNOP String")
+synop_text = st.text_area(
+    "AAXX SYNOP Code (Optional / Auto-captured on submit)",
+    value=st.session_state.get("last_captured_synop", ""),
+    height=100,
+)
+
+submit_btn = st.button("Save Locally & Push to BMKGSoft")
 
 # --- SUBMISSION EXECUTION ---
 if submit_btn:
@@ -306,59 +567,73 @@ if submit_btn:
       "present_weather_ww": ww,
       "pressure_reading_mb": None,
       "pressure_temp_c": None,
-      "rainfall_last_mm": rainfall if rainfall is not None else 0,
+      "rainfall_last_mm": rainfall_last_mm,
       "temp_drybulb_c_tttttt": temp_dry,
       "temp_max_c_txtxtx": temp_max,
       "temp_min_c_tntntn": temp_min,
       "temp_wetbulb_c": temp_wet,
-      "cloud_cover_oktas_m": cloud_m,
-      "cloud_low_type_cl": cloud_cl,
-      "cloud_med_type_cm": cloud_cm,
-      "cloud_high_type_ch": cloud_ch,
-      "cloud_low_cover_oktas": "/",
-      "cloud_med_cover_oktas": "/",
-      "cloud_high_cover_oktas": "/",
-      "cloud_low_type_1": "/",
-      "cloud_low_type_2": "",
-      "cloud_low_type_3": "",
-      "cloud_med_type_1": "/",
-      "cloud_med_type_2": "",
-      "cloud_high_type_1": "/",
-      "cloud_high_type_2": "",
-      "cloud_low_base_1": None,
-      "cloud_low_base_2": None,
-      "cloud_low_base_3": None,
-      "cloud_med_base_1": None,
-      "cloud_med_base_2": None,
-      "cloud_high_base_1": None,
-      "cloud_high_base_2": None,
-      "cloud_low_peak_1": None,
-      "cloud_low_peak_2": None,
-      "cloud_low_cover_1": "/",
-      "cloud_low_cover_2": "",
-      "cloud_low_cover_3": "",
-      "cloud_med_cover_1": "/",
-      "cloud_med_cover_2": "",
-      "cloud_high_cover_1": "/",
-      "cloud_high_cover_2": "",
-      "cloud_low_dir_1": 9,
-      "cloud_low_dir_2": None,
-      "cloud_low_dir_3": None,
-      "cloud_med_dir_1": 9,
-      "cloud_med_dir_2": None,
-      "cloud_high_dir_1": 9,
-      "cloud_high_dir_2": None,
-      "cloud_elevation_angle_ec_1": None,
-      "cloud_elevation_angle_ec_2": None,
-      "cloud_low_dir_true_da_1": None,
-      "cloud_low_dir_true_da_2": None,
-      "cloud_vertical_vis": None,
-      "solar_rad_24h_jcm2_f24": None,
-      "sunshine_h_sss": None,
-      "evaporation_24hours_mm_eee": None,
-      "evaporation_eq_indicator_ie": None,
-      "land_cond": 0,
-      "land_note": "",
+      "cloud_cover_oktas_m": cloud_cover_oktas_m,
+      "cloud_vertical_vis": cloud_vertical_vis,
+      "cloud_low_type_cl": cloud_low_type_cl,
+      "cloud_low_cover_oktas": cloud_low_cover_oktas,
+      "cloud_low_type_1": cloud_low_type_1,
+      "cloud_low_type_2": cloud_low_type_2,
+      "cloud_low_type_3": cloud_low_type_3,
+      "cloud_low_cover_1": cloud_low_cover_1,
+      "cloud_low_cover_2": cloud_low_cover_2,
+      "cloud_low_cover_3": cloud_low_cover_3,
+      "cloud_low_base_1": cloud_low_base_1,
+      "cloud_low_base_2": cloud_low_base_2,
+      "cloud_low_base_3": cloud_low_base_3,
+      "cloud_low_peak_1": cloud_low_peak_1,
+      "cloud_low_peak_2": cloud_low_peak_2,
+      "cloud_low_dir_1": (
+          int(cloud_low_dir_1) if cloud_low_dir_1 is not None else None
+      ),
+      "cloud_low_dir_2": (
+          int(cloud_low_dir_2) if cloud_low_dir_2 is not None else None
+      ),
+      "cloud_low_dir_3": (
+          int(cloud_low_dir_3) if cloud_low_dir_3 is not None else None
+      ),
+      "cloud_elevation_angle_ec_1": cloud_elevation_angle_ec_1,
+      "cloud_elevation_angle_ec_2": cloud_elevation_angle_ec_2,
+      "cloud_low_dir_true_da_1": cloud_low_dir_true_da_1,
+      "cloud_low_dir_true_da_2": cloud_low_dir_true_da_2,
+      "cloud_med_type_cm": cloud_med_type_cm,
+      "cloud_med_cover_oktas": cloud_med_cover_oktas,
+      "cloud_med_type_1": cloud_med_type_1,
+      "cloud_med_type_2": cloud_med_type_2,
+      "cloud_med_cover_1": cloud_med_cover_1,
+      "cloud_med_cover_2": cloud_med_cover_2,
+      "cloud_med_base_1": cloud_med_base_1,
+      "cloud_med_base_2": cloud_med_base_2,
+      "cloud_med_dir_1": (
+          int(cloud_med_dir_1) if cloud_med_dir_1 is not None else None
+      ),
+      "cloud_med_dir_2": (
+          int(cloud_med_dir_2) if cloud_med_dir_2 is not None else None
+      ),
+      "cloud_high_type_ch": cloud_high_type_ch,
+      "cloud_high_cover_oktas": cloud_high_cover_oktas,
+      "cloud_high_type_1": cloud_high_type_1,
+      "cloud_high_type_2": cloud_high_type_2,
+      "cloud_high_cover_1": cloud_high_cover_1,
+      "cloud_high_cover_2": cloud_high_cover_2,
+      "cloud_high_base_1": cloud_high_base_1,
+      "cloud_high_base_2": cloud_high_base_2,
+      "cloud_high_dir_1": (
+          int(cloud_high_dir_1) if cloud_high_dir_1 is not None else None
+      ),
+      "cloud_high_dir_2": (
+          int(cloud_high_dir_2) if cloud_high_dir_2 is not None else None
+      ),
+      "solar_rad_24h_jcm2_f24": solar_rad_24h_jcm2_f24,
+      "sunshine_h_sss": sunshine_h_sss,
+      "evaporation_24hours_mm_eee": evaporation_24hours_mm_eee,
+      "evaporation_eq_indicator_ie": evaporation_eq_indicator_ie,
+      "land_cond": land_cond,
+      "land_note": land_note,
       "pressure_qff_mb_derived": qff,
       "pressure_qfe_mb_derived": qfe,
   }
@@ -367,18 +642,11 @@ if submit_btn:
     full_payload[flag] = False
 
   try:
-    # STEP 1: Fetch server-generated SYNOP string from the official preview route
-    st.text("Generating official AAXX SYNOP string from BMKGSoft preview...")
-    generated_synop, preview_json, preview_status = get_bmkg_preview_synop(
+    # STEP 1: Fetch server SYNOP string from preview endpoint
+    st.text("Generating official AAXX SYNOP string from BMKGSoft...")
+    generated_synop, _, _ = get_bmkg_preview_synop(
         headers, full_payload, iso_utc_timestamp
     )
-
-    with st.expander(
-        f"🔍 BMKGSoft Preview API Response (Status: {preview_status})",
-        expanded=True,
-    ):
-      st.json(preview_json)
-
     final_synop = generated_synop if generated_synop else synop_text
 
     # STEP 2: Send GTS Broadcast for primary hours
@@ -449,3 +717,154 @@ if submit_btn:
         f"Network Exception: {err}. Entry saved safely in local station database"
         " (`station_me48.db`)."
     )
+
+# ==============================================================================
+# GTS DIRECT BROADCAST & METAR GENERATOR (WITH DEBUG SUITE)
+# ==============================================================================
+st.markdown("---")
+st.subheader("✈️ WAGB METAR Generator & GTS Direct Entry")
+
+# 1. Initialize text box key directly
+if "manual_sandi_input" not in st.session_state:
+  st.session_state["manual_sandi_input"] = ""
+
+
+# 2. Bridge function with full try-catch & debug logging
+def convert_synop_to_metar():
+  try:
+    # 1. Capture base parameters
+    v_date = globals().get("obs_date", None)
+    v_hour = globals().get("obs_hour", None)
+    v_wdir = globals().get("wind_dir", None)
+    v_wspd = globals().get("wind_speed", None)
+    v_wgst = globals().get("wind_gust", None)
+    v_vis = globals().get("visibility", None)
+    v_ww = globals().get("ww_present", None)
+    v_tdry = globals().get("temp_dry", None)
+    v_tdew = globals().get("temp_dew", None)
+    v_qff = globals().get("qff", None)
+
+    # 2. Extract Low Cloud Layer 1 using your exact variable names
+    g_1 = globals().get("cloud_low_type_1", None)
+    n_1 = globals().get("cloud_low_cover_1", None)
+    h_1 = globals().get("cloud_low_base_1", None)
+
+    layers = []
+    # Verify Layer 1 has non-empty inputs
+    if n_1 and h_1 is not None:
+      try:
+        oktas_int = int(str(n_1).strip())
+        height_flt = float(h_1)
+        layers.append((oktas_int, height_flt, g_1))
+      except (ValueError, TypeError):
+        pass
+
+    # 3. Optional: Extract Layer 2 if you added extra layer widgets
+    g_2 = globals().get("cloud_low_type_2", None)
+    n_2 = globals().get("cloud_low_cover_2", None)
+    h_2 = globals().get("cloud_low_base_2", None)
+
+    if n_2 and h_2 is not None:
+      try:
+        oktas_int_2 = int(str(n_2).strip())
+        height_flt_2 = float(h_2)
+        layers.append((oktas_int_2, height_flt_2, g_2))
+      except (ValueError, TypeError):
+        pass
+
+    vis_in_meters = float(v_vis) * 1000 if v_vis is not None else 9999.0
+
+    # 4. Generate METAR via metar.py
+    raw_metar, wmo_bulletin = convert_synop_to_metar_peraturan(
+        obs_date=v_date,
+        obs_hour=v_hour,
+        wind_dir=v_wdir,
+        wind_spd=v_wspd,
+        wind_gust=v_wgst,
+        visibility_m=vis_in_meters,
+        ww_code=v_ww,
+        temp_dry=v_tdry,
+        temp_dew=v_tdew,
+        qnh_hpa=float(v_qff) if v_qff is not None else None,
+        cloud_layers=layers,
+        station_icao="WAGB",
+    )
+
+    # 5. Populate text area
+    st.session_state["manual_sandi_input"] = wmo_bulletin
+    st.toast("✅ METAR berhasil dibuat!", icon="⚡")
+
+  except Exception as e:
+    st.error(f"❌ Error saat convert_synop_to_metar: {e}")
+
+
+# 3. Action buttons
+col_gen, col_clear, col_debug = st.columns([3, 1, 2])
+with col_gen:
+  # Using on_click callback guarantees state is set before the text_area renders
+  st.button(
+      "⚡ Generate METAR dari SYNOP",
+      on_click=convert_synop_to_metar,
+      use_container_width=True,
+  )
+
+with col_clear:
+  if st.button("🗑️ Kosongkan", use_container_width=True):
+    st.session_state["manual_sandi_input"] = ""
+    st.rerun()
+
+with col_debug:
+  show_debug = st.checkbox("🔍 Tampilkan Debug Form", value=False)
+
+# 4. Text Area Matching BMKGSoft UI
+sandi_val = st.text_area(
+    label="Sandi",
+    height=140,
+    key="manual_sandi_input",
+    placeholder="Masukkan sandi yang akan dikirimkan",
+)
+
+# 5. Debug Panel: Inspect what SYNOP variables actually exist
+if show_debug:
+  with st.expander("🛠️ Variable Inspection Inspector", expanded=True):
+    captured_vars = {
+        "obs_date": repr(globals().get("obs_date")),
+        "obs_hour": repr(globals().get("obs_hour")),
+        "wind_dir": repr(globals().get("wind_dir")),
+        "wind_speed": repr(globals().get("wind_speed")),
+        "wind_gust": repr(globals().get("wind_gust")),
+        "visibility": repr(globals().get("visibility")),
+        "ww_present": repr(globals().get("ww_present")),
+        "temp_dry": repr(globals().get("temp_dry")),
+        "temp_dew": repr(globals().get("temp_dew")),
+        "qfe": repr(globals().get("qfe")),
+        "live_qnh (session_state)": repr(st.session_state.get("live_qnh")),
+    }
+    st.json(captured_vars)
+    st.write(
+        "Current `manual_sandi_input` in Session State:",
+        [st.session_state.get("manual_sandi_input")],
+    )
+
+# 6. Send to GTS Button
+col_empty, col_send = st.columns([5, 1])
+with col_send:
+  send_to_gts = st.button("Send", type="primary", use_container_width=True)
+
+if send_to_gts:
+  if not sandi_val.strip():
+    st.warning("Sandi tidak boleh kosong.")
+  else:
+    gts_endpoint = "https://bmkgsatu.bmkg.go.id/api/v21/gts/entry"
+    payload = {"sandi": sandi_val.strip(), "only_save": False}
+    try:
+      with st.spinner("Mengirim sandi ke GTS..."):
+        res = requests.post(
+            gts_endpoint, json=payload, headers=headers, timeout=10
+        )
+        if res.status_code == 200:
+          st.success("✅ Sandi berhasil dikirim ke GTS!")
+        else:
+          st.error(f"❌ Gagal mengirim ke GTS ({res.status_code}): {res.text}")
+    except requests.exceptions.RequestException as err:
+      st.error(f"Network error: {err}")
