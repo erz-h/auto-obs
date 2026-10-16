@@ -4,88 +4,210 @@ import re
 from typing import Any, List, Optional, Tuple
 
 
+# =============================================================================
+# HELPER FUNCTIONS (Must be at the top of the file)
+# =============================================================================
 def _safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
-  """Safely converts string, float, or None to an int."""
-  if val is None or val == "":
+  if val is None or str(val).strip() in ["", "None", "/"]:
     return default
   try:
-    return int(float(val))
+    return int(float(str(val).strip()))
   except (ValueError, TypeError):
     return default
 
 
-def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
-  """Safely converts string, int, or None to a float."""
-  if val is None or val == "":
+def _safe_float(
+    val: Any, default: Optional[float] = None
+) -> Optional[float]:
+  if val is None or str(val).strip() in ["", "None", "/"]:
     return default
   try:
-    return float(val)
+    return float(str(val).strip())
   except (ValueError, TypeError):
     return default
-
-
-def _parse_hour_str(obs_hour: Any) -> str:
-  """Extracts a two-digit hour string regardless of input format.
-
-  Handles ints (0 -> '00'), strings ('06', '06 UTC', '06:00'), or None.
-  """
-  if obs_hour is None:
-    return "00"
-  if isinstance(obs_hour, int):
-    return f"{obs_hour:02d}"
-
-  # Extract leading digits if format is '06 UTC' or '06:00'
-  match = re.search(r"\d+", str(obs_hour))
-  if match:
-    val = int(match.group())
-    return f"{val:02d}"
-  return "00"
 
 
 def _parse_day_str(obs_date: Any) -> str:
-  """Extracts a two-digit day string from datetime, date, or ISO string."""
   if hasattr(obs_date, "strftime"):
     return obs_date.strftime("%d")
-  if isinstance(obs_date, str):
-    match = re.findall(r"\d+", obs_date)
-    if match:
-      # Assume last or middle element is day
-      return f"{int(match[-1]):02d}"
-  return datetime.utcnow().strftime("%d")
+  s = str(obs_date).strip()
+  if "-" in s:
+    return s.split("-")[-1].zfill(2)
+  return s.zfill(2)[-2:]
 
 
-def round_metar_temp(val: Any) -> str:
-  """Rounds temperature to full integer per Peraturan BMKG No. 001/2009 Section A.12.
-
-  Values exactly at 0.5 round up algebraically. Negative values are prefixed
-  with 'M'.
-  """
-  f_val = _safe_float(val)
-  if f_val is None:
-    return ""
-
-  rounded = math.floor(f_val + 0.5)
-  if rounded < 0:
-    return f"M{abs(rounded):02d}"
-  return f"{rounded:02d}"
+def _parse_hour_str(obs_hour: Any) -> str:
+  s = str(obs_hour).strip()
+  if ":" in s:
+    return s.split(":")[0].zfill(2)
+  val = _safe_int(s, 0)
+  return f"{val:02d}"
 
 
-def round_metar_vis(vis_m: Any) -> str:
-  """Rounds visibility downwards per Peraturan BMKG No. 001/2009 Section A.7.1."""
-  v_val = _safe_float(vis_m)
-  if v_val is None:
-    return "9999"
-
-  v = int(v_val)
+def round_metar_vis(visibility_m: Any) -> str:
+  v = _safe_float(visibility_m, default=9999.0)
   if v >= 10000:
     return "9999"
-  elif v >= 5000:
-    return f"{(v // 1000) * 1000:04d}"
-  elif v >= 800:
-    return f"{(v // 100) * 100:04d}"
-  else:
-    return f"{(v // 50) * 50:04d}"
+  if v >= 5000:
+    return f"{int(math.floor(v / 1000.0) * 1000):04d}"
+  if v >= 800:
+    return f"{int(math.floor(v / 100.0) * 100):04d}"
+  return f"{int(math.floor(v / 50.0) * 50):04d}"
 
+
+def round_metar_temp(temp_c: Any) -> str:
+  val = _safe_float(temp_c)
+  if val is None:
+    return ""
+  rounded = int(round(val))
+  if rounded < 0:
+    return f"M{abs(rounded):02d}"
+  return f"{abs(rounded):02d}"
+
+def convert_ww_to_metar(
+    ww_code: Any, visibility_m: Optional[float] = 9999.0
+) -> str:
+  """Translates WMO Code Table 4677 (SYNOP ww) to WMO Table 4678 / ICAO METAR
+
+  present weather descriptor, enforcing visibility cutoffs per regulations.
+  """
+  wx_code = _safe_int(ww_code)
+  if wx_code is None or wx_code in [0, 1, 2, 3]:
+    return ""
+
+  v_num = _safe_float(visibility_m, default=9999.0)
+
+  # 04 - 09: Obscuration / Lithometeors (Requires Vis <= 5000m)
+  if wx_code == 4:
+    return "FU" if v_num <= 5000 else ""  # Smoke
+  if wx_code == 5:
+    return "HZ" if v_num <= 5000 else ""  # Haze
+  if wx_code in [6, 7]:
+    return "DU" if v_num <= 5000 else ""  # Dust / Dust storm
+  if wx_code == 8:
+    return "PO"  # Dust whirls
+  if wx_code == 9:
+    return "DS"  # Duststorm
+
+  # 10 - 19: Non-precipitation / Atmospheric phenomena
+  if wx_code == 10:
+    return "BR" if 1000 <= v_num <= 5000 else ""  # Mist
+  if wx_code in [11, 12]:
+    return "MIFG"  # Shallow fog
+  if wx_code == 13:
+    return "VCTS"  # Distant lightning
+  if wx_code == 17:
+    return "TS"  # Thunder heard, no precipitation at station
+  if wx_code == 18:
+    return "SQ"  # Squall
+  if wx_code == 19:
+    return "FC"  # Funnel cloud / Tornado / Waterspout
+
+  # 20 - 29: Recent Weather in past hour (RE prefix)
+  recent_map = {
+      20: "REDZ",
+      21: "RERA",
+      22: "RESN",
+      23: "RERASN",
+      24: "REFZRA",
+      25: "RESHRA",
+      26: "RESHSN",
+      27: "REGR",
+      28: "REFG",
+      29: "RETS",
+  }
+  if wx_code in recent_map:
+    return recent_map[wx_code]
+
+  # 30 - 39: Dust / Sand / Snow storms
+  if 30 <= wx_code <= 35:
+    return "+SA" if wx_code in [32, 35] else "SA"
+
+  # 40 - 49: Fog (FG requires Vis < 1000m; if Vis >= 1000m it is BR)
+  if wx_code in [40, 41]:
+    return "BCFG" if v_num < 1000 else "BR"
+  if 42 <= wx_code <= 47:
+    return "FG" if v_num < 1000 else "BR"
+  if wx_code in [48, 49]:
+    return "FZFG" if v_num < 1000 else "BR"
+
+  # 50 - 59: Drizzle (Gerimis)
+  if wx_code in [50, 51]:
+    return "-DZ"
+  if wx_code in [52, 53]:
+    return "DZ"
+  if wx_code in [54, 55]:
+    return "+DZ"
+  if wx_code == 56:
+    return "-FZDZ"
+  if wx_code == 57:
+    return "+FZDZ"
+  if wx_code in [58, 59]:
+    return "DZRA"
+
+  # 60 - 69: Rain (Hujan)
+  if wx_code in [60, 61]:
+    return "-RA"
+  if wx_code in [62, 63]:
+    return "RA"
+  if wx_code in [64, 65]:
+    return "+RA"
+  if wx_code == 66:
+    return "-FZRA"
+  if wx_code == 67:
+    return "+FZRA"
+  if wx_code in [68, 69]:
+    return "-RASN" if wx_code == 68 else "+RASN"
+
+  # 70 - 79: Solid precipitation
+  if wx_code in [70, 71]:
+    return "-SN"
+  if wx_code in [72, 73]:
+    return "SN"
+  if wx_code in [74, 75]:
+    return "+SN"
+  if wx_code == 76:
+    return "IC"
+  if wx_code == 77:
+    return "SG"
+  if wx_code == 79:
+    return "PL"
+
+  # 80 - 90: Showers
+  if wx_code == 80:
+    return "-SHRA"
+  if wx_code == 81:
+    return "SHRA"
+  if wx_code == 82:
+    return "+SHRA"
+  if wx_code in [83, 84]:
+    return "-SHRASN" if wx_code == 83 else "+SHRASN"
+  if wx_code in [85, 86]:
+    return "-SHSN" if wx_code == 85 else "+SHSN"
+  if wx_code in [87, 88]:
+    return "SHGS"
+  if wx_code in [89, 90]:
+    return "+SHGR" if wx_code == 90 else "-SHGR"
+
+  # 91 - 99: Thunderstorms (Badai Guntur)
+  if wx_code == 91:
+    return "-RA RETS"
+  if wx_code == 92:
+    return "RA RETS"
+  if wx_code in [93, 94]:
+    return "SN RETS"
+  if wx_code == 95:
+    return "TSRA"  # Moderate TS with rain
+  if wx_code == 96:
+    return "TSGR"  # Moderate TS with hail
+  if wx_code == 97:
+    return "+TSRA"  # Severe TS with rain
+  if wx_code == 98:
+    return "TSSA"  # TS with dust/sand
+  if wx_code == 99:
+    return "+TSGR"  # Severe TS with hail
+
+  return ""
 
 def convert_synop_to_metar_peraturan(
     obs_date: Any,
@@ -98,8 +220,9 @@ def convert_synop_to_metar_peraturan(
     temp_dry: Any,
     temp_dew: Any,
     qnh_hpa: Any,
-    cloud_layers: Optional[List[Tuple[int, float, str]]] = None,
+    cloud_layers: Optional[List[Union[Tuple[Any, Any, Any], str]]] = None,
     station_icao: str = "WAGB",
+    is_speci: bool = False,
 ) -> Tuple[str, str]:
   """Translates SYNOP observation variables to a compliant METAR string
 
@@ -116,133 +239,115 @@ def convert_synop_to_metar_peraturan(
   w_gst_raw = _safe_float(wind_gust)
 
   if w_spd_raw is None or w_spd_raw < 1:
-    wind_str = "00000KT"  # Calm[cite: 10]
+    wind_str = "00000KT"  # Calm
   else:
-    # Round direction to nearest 10 degrees[cite: 10]
-    w_dir = int(round(w_dir_raw / 10.0) * 10) if w_dir_raw is not None else 0  #[cite: 10]
+    # Round direction to nearest 10 degrees
+    w_dir = int(round(w_dir_raw / 10.0) * 10) if w_dir_raw is not None else 0
     if w_dir == 0 and w_spd_raw >= 1:
-      w_dir = 360  # True North[cite: 10]
+      w_dir = 360  # True North
 
-    # Speed & Gust[cite: 10]
+    # Speed & Gust
     spd_val = int(w_spd_raw)
-    spd_str = "P99" if spd_val >= 100 else f"{spd_val:02d}"  #[cite: 10]
+    spd_str = "P99" if spd_val >= 100 else f"{spd_val:02d}"
 
     gust_str = ""
     if w_gst_raw is not None and (w_gst_raw - w_spd_raw >= 10):
-      gust_str = f"G{int(w_gst_raw):02d}"  #[cite: 10]
+      gust_str = f"G{int(w_gst_raw):02d}"
 
     wind_str = f"{w_dir:03d}{spd_str}{gust_str}KT"
 
-  # 3. Horizontal Visibility (Section A.7)[cite: 11, 12]
-  vis_part = round_metar_vis(visibility_m)  #[cite: 11, 12]
-
-  # 4. Present Weather (Section A.9 & Table 4678)[cite: 15, 35]
-  wx_code = _safe_int(ww_code)
+  # 3. Horizontal Visibility (Section A.7)
+  vis_part = round_metar_vis(visibility_m)
   v_num = _safe_float(visibility_m, default=9999.0)
-  wx_str = ""
 
-  if wx_code is not None:
-    if wx_code in [4, 5]:
-      wx_str = "HZ" if v_num <= 5000 else ""  #[cite: 38, 41]
-    elif wx_code == 10:
-      wx_str = "BR" if 1000 <= v_num <= 5000 else ""  #[cite: 38, 41]
-    elif 40 <= wx_code <= 49:
-      wx_str = "FG" if v_num < 1000 else "BR"  #[cite: 38, 41]
-    elif 50 <= wx_code <= 55:
-      wx_str = "-DZ" if wx_code in [50, 51] else "DZ"  #[cite: 35, 40]
-    elif 60 <= wx_code <= 65:
-      wx_str = "-RA" if wx_code in [60, 61] else "RA"  #[cite: 35, 40]
-    elif wx_code in [66, 67]:
-      wx_str = "+RA"  #[cite: 35, 40]
-    elif 80 <= wx_code <= 82:
-      wx_str = (
-          "-SHRA" if wx_code == 80 else ("SHRA" if wx_code == 81 else "+SHRA")
-      )  #[cite: 35, 40]
-    elif 91 <= wx_code <= 99 or wx_code in [17, 29]:
-      wx_str = (
-          "TSRA"
-          if (60 <= wx_code <= 69 or 80 <= wx_code <= 82)
-          else ("+TSRA" if wx_code in [95, 97] else "TS")
-      )  #[cite: 35, 37, 40]
+  # 4. Present Weather (Section A.9 & WMO Table 4678)
+  v_num = _safe_float(visibility_m, default=9999.0)
+  wx_str = convert_ww_to_metar(ww_code, visibility_m=v_num)
 
+  # 5. Cloud Layers / Vertical Visibility (Section A.10)
   cloud_tokens = []
   if cloud_layers:
-        valid_layers = [
-            lyr for lyr in cloud_layers 
-            if lyr[0] is not None and lyr[1] is not None and _safe_float(lyr[1]) is not None
-        ]
-        
-        for oktas_raw, h_m_raw, genus_raw in valid_layers:
-            oktas = _safe_int(oktas_raw)
-            h_m = _safe_float(h_m_raw)
-            
-            if oktas is None or oktas <= 0 or h_m is None:
-                continue
+    for layer in cloud_layers:
+      # Direct string tokens (e.g., 'VV003', 'FEW015CB', 'NSC')
+      if isinstance(layer, str):
+        if layer.strip():
+          cloud_tokens.append(layer.strip())
+        continue
 
-            # Amount categories #[cite: 17]
-            if 1 <= oktas <= 2:
-                amt = "FEW" #[cite: 17]
-            elif 3 <= oktas <= 4:
-                amt = "SCT" #[cite: 17]
-            elif 5 <= oktas <= 7:
-                amt = "BKN" #[cite: 17]
-            elif oktas >= 8:
-                amt = "OVC" #[cite: 17]
-            else:
-                continue
+      # Tuple of (oktas, height_meters, genus)
+      if isinstance(layer, (list, tuple)) and len(layer) >= 3:
+        oktas_raw, h_m_raw, genus_raw = layer[0], layer[1], layer[2]
+        oktas = _safe_int(oktas_raw)
+        h_m = _safe_float(h_m_raw)
 
-            # Height: meters to feet, rounded UP (ceil) to hundreds of feet #[cite: 18, 28]
-            h_ft = h_m * 3.28084
-            if h_ft <= 10000:
-                h_code = f"{int(math.ceil(h_ft / 100.0)):03d}" #[cite: 18, 28]
-            else:
-                h_code = f"{int(math.ceil(h_ft / 1000.0) * 10):03d}" #[cite: 18, 28]
+        if oktas is None or oktas <= 0 or h_m is None:
+          continue
 
-            # Convective Genus Suffix:
-            # 9 (Cb) -> CB
-            # 8 (Cu) -> TCU
-            # 6 (Sc), 7 (St), / -> no suffix
-            g_val = str(genus_raw or "").strip().lower()
-            convective = ""
+        # Okta to Amount Category
+        if 1 <= oktas <= 2:
+          amt = "FEW"
+        elif 3 <= oktas <= 4:
+          amt = "SCT"
+        elif 5 <= oktas <= 7:
+          amt = "BKN"
+        elif oktas >= 8:
+          amt = "OVC"
+        else:
+          continue
 
-            if g_val in ["9", "cb"] or "cumulonimbus" in g_val:  #[cite: 17, 48]
-              convective = "CB"  #[cite: 17]
-            elif (
-                g_val in ["8", "cu", "tcu"] or "cumulus" in g_val
-            ) and "strato" not in g_val:  #[cite: 17, 48]
-              convective = "TCU"  #[cite: 17]
+        # Height: convert meters to feet, rounded UP (ceil) to hundreds of feet
+        h_ft = h_m * 3.28084
+        if h_ft <= 10000:
+          h_code = f"{int(math.ceil(h_ft / 100.0)):03d}"
+        else:
+          h_code = f"{int(math.ceil(h_ft / 1000.0) * 10):03d}"
 
-            # Append the complete layer token[cite: 8]
-            cloud_tokens.append(f"{amt}{h_code}{convective}")
+        # Convective Suffix (CB / TCU)
+        g_val = str(genus_raw or "").strip().lower()
+        convective = ""
+        if g_val in ["9", "cb"] or "cumulonimbus" in g_val:
+          convective = "CB"
+        elif (
+            g_val in ["8", "cu", "tcu"] or "cumulus" in g_val
+        ) and "strato" not in g_val:
+          convective = "TCU"
 
-  # Blank if no valid cloud layers exist
+        cloud_tokens.append(f"{amt}{h_code}{convective}")
+
   cloud_part = " ".join(cloud_tokens) if cloud_tokens else ""
 
-
-  # 6. Air Temperature / Dew Point (Section A.12)[cite: 19]
-  t_str = round_metar_temp(temp_dry)  #[cite: 19]
-  td_str = round_metar_temp(temp_dew)  #[cite: 19]
+  # 6. Air Temperature / Dew Point (Section A.12)
+  t_str = round_metar_temp(temp_dry)
+  td_str = round_metar_temp(temp_dew)
   temp_part = f"{t_str}/{td_str}" if (t_str and td_str) else ""
 
-  # 7. Pressure QNH (Section A.13 - Strictly floored to whole hPa)[cite: 19]
+  # 7. Pressure QNH (Section A.13 - Floored to integer hPa per regulations)
   q_val = _safe_float(qnh_hpa)
-  qnh_part = f"Q{int(math.floor(q_val)):04d}" if q_val is not None else ""  #[cite: 19]
+  qnh_part = f"Q{int(math.floor(q_val)):04d}" if q_val is not None else ""
 
-  # 8. Assemble METAR tokens (empty tokens are stripped out)
+  # 8. Assemble Message Tokens
+  header_ident = "SPECI" if is_speci else "METAR"
   tokens = [
-      "METAR",  #[cite: 8]
-      station_icao,  #[cite: 8]
-      f"{ts_code}Z",  #[cite: 8]
-      wind_str,  #[cite: 8]
-      vis_part,  #[cite: 8]
-      wx_str,  #[cite: 8]
-      cloud_part,  # Blank if none
-      temp_part,  #[cite: 8]
-      qnh_part,  #[cite: 8]
-      "NOSIG=",  #[cite: 8, 25]
+      header_ident,
+      station_icao,
+      f"{ts_code}Z",
+      wind_str,
+      vis_part,
+      wx_str,
+      cloud_part,
+      temp_part,
+      qnh_part,
+      "NOSIG=",
   ]
 
   encoded_metar = " ".join([t for t in tokens if t])
-  bulletin_with_header = f"SAID40 {station_icao} {ts_code}\n{encoded_metar}"
+
+  # WMO Bulletin Header: SAID40 for routine METAR, SPID40 for SPECI
+  bulletin_prefix = "SPID40" if is_speci else "SAID40"
+  bulletin_with_header = (
+      f"{bulletin_prefix} {station_icao} {ts_code}\n{encoded_metar}"
+  )
 
   return encoded_metar, bulletin_with_header
+
+translate_ww_to_metar = convert_ww_to_metar
