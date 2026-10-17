@@ -5,6 +5,7 @@ Schema strictly mirrors BMKGSoft manual_entry + server response + encoded METAR.
 """
 
 import sqlite3
+import pandas as pd
 
 DB_PATH = "station_me48.db"
 
@@ -144,7 +145,6 @@ def save_local_observation(
   """Saves observation by extracting directly from the combined server response or fallback payload."""
   init_db()
 
-  # Fields pulled directly from response keys (or form fallback)
   data = (
       record.get("data_timestamp") or record.get("timestamp"),
       record.get("bmkgsoft_id"),
@@ -159,15 +159,17 @@ def save_local_observation(
       record.get("weather_indicator_ix", 1),
       record.get("temp_drybulb_c_tttttt") or record.get("temp_dry"),
       record.get("temp_wetbulb_c") or record.get("temp_wet"),
-      record.get("temp_dewpoint_c_tdtdtd"),  # straight from BMKG server
-      record.get("relative_humidity_pc"),  # straight from BMKG server
+      record.get("temp_dewpoint_c_tdtdtd")
+      or record.get("temp_dewpoint_c"),  # from server preview
+      record.get("relative_humidity_pc")
+      or record.get("humidity_rel_percent"),  # from server preview
       record.get("temp_max_c_txtxtx"),
       record.get("temp_min_c_tntntn"),
       record.get("pressure_reading_mb"),
       record.get("pressure_temp_c"),
-      record.get("pressure_qff_mb_derived"),  # straight from BMKG server
-      record.get("pressure_qfe_mb_derived"),  # straight from BMKG server
-      record.get("pressure_3h_diff_mb_ppp"),  # straight from BMKG server
+      record.get("pressure_qff_mb_derived"),
+      record.get("pressure_qfe_mb_derived"),
+      record.get("pressure_3h_diff_mb_ppp"),  # from server preview
       record.get("rainfall_last_mm"),
       record.get("rainfall_indicator_ir"),
       record.get("cloud_cover_oktas_m"),
@@ -219,7 +221,7 @@ def save_local_observation(
       record.get("land_cond"),
       record.get("land_note"),
       record.get("encoded_synop") or encoded_synop,
-      encoded_metar,
+      record.get("encoded_metar") or encoded_metar,
       synced,
   )
 
@@ -265,5 +267,30 @@ def save_local_observation(
     conn.commit()
 
 
+def get_historical_records(
+    start_date: str = None, end_date: str = None
+) -> pd.DataFrame:
+  """Queries all historical ME-48 observations with all 75 parameters."""
+  init_db()
+  with sqlite3.connect(DB_PATH) as conn:
+    query = "SELECT * FROM me48_observations"
+    conditions = []
+    params = []
+
+    if start_date:
+      conditions.append("date(data_timestamp) >= date(?)")
+      params.append(start_date)
+    if end_date:
+      conditions.append("date(data_timestamp) <= date(?)")
+      params.append(end_date)
+
+    if conditions:
+      query += " WHERE " + " AND ".join(conditions)
+
+    query += " ORDER BY data_timestamp DESC"
+    return pd.read_sql_query(query, conn, params=params)
+
+
 if __name__ == "__main__":
   init_db()
+  print("Database initialized successfully.")
