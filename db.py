@@ -290,6 +290,20 @@ def get_historical_records(
     query += " ORDER BY data_timestamp DESC"
     return pd.read_sql_query(query, conn, params=params)
 
+def init_evaporation_table(db_path: str = DB_PATH):
+  with sqlite3.connect(db_path) as conn:
+    cursor = conn.cursor()
+    cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pan_evaporation (
+                obs_date TEXT PRIMARY KEY,
+                scale_1 REAL,
+                scale_2 REAL DEFAULT 20.0,
+                diff_h REAL,
+                rainfall_r REAL DEFAULT 0.0,
+                evaporation_ev REAL
+            )
+        """)
+    conn.commit()
 
 if __name__ == "__main__":
   init_db()
