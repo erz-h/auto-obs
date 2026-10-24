@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#38bdf8"             # Cyan terang untuk aksen dan tombol
+backgroundColor = "#0f172a"          # Latar utama (biru malam / dark slate)
+secondaryBackgroundColor = "#1e293b" # Latar sidebar dan kartu input
+textColor = "#f1f5f9"                # Teks putih keabuan
+font = "sans serif"

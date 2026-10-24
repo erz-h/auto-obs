@@ -1,7 +1,7 @@
 """acs_reporter.py.
 
 Aerodrome Climatological Summary (ACS) Generator for Aviation (WAGB / 96655).
-Parses standard ICAO/BMKG 'encoded_metar' strings from SQLite and compiles:
+Parses standard ICAO/BMKG METAR bulletins from the 'metar_logs' SQLite table and compiles:
   1. Table A: Visibility vs Cloud Ceiling Operational Distribution
   2. Table B: Bivariate Surface Wind Direction vs Speed (Wind Rose Matrix)
   3. Table C: Hourly/Diurnal Temperature, Dewpoint, and QNH Climatology
@@ -11,7 +11,7 @@ Parses standard ICAO/BMKG 'encoded_metar' strings from SQLite and compiles:
 from datetime import datetime
 import re
 import sqlite3
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import pandas as pd
 
 DB_PATH = "station_me48.db"
@@ -35,7 +35,7 @@ class METARParser:
 
   @staticmethod
   def parse(metar_str: str) -> Optional[Dict[str, Any]]:
-    if not metar_str or "METAR" not in metar_str:
+    if not metar_str or "METAR" not in metar_str and "SPECI" not in metar_str:
       return None
 
     data = {
@@ -80,13 +80,12 @@ class METARParser:
         deg = int(w_str[0:3])
         spd = int(w_str[3:5])
         data["wind_speed_kt"] = spd
-        # Konversi ke 8 Mata Angin Utama
         data["wind_dir"] = METARParser._deg_to_cardinal(deg)
 
     # 3. Parse Jarak Pandang (Visibility)
     if "CAVOK" in metar_str:
       data["vis_meters"] = 9999
-      data["ceiling_feet"] = 9999  # Awan di atas 5000ft
+      data["ceiling_feet"] = 9999
     else:
       m_vis = METARParser.VIS_REGEX.search(metar_str)
       if m_vis:
@@ -108,18 +107,14 @@ class METARParser:
     if ceilings:
       data["ceiling_feet"] = min(ceilings)
     elif "CAVOK" not in metar_str and data["ceiling_feet"] is None:
-      data["ceiling_feet"] = 9999  # Tidak ada awan operasional (No ceiling)
+      data["ceiling_feet"] = 9999
 
     # 6. Parse Suhu dan Titik Embun (TT/Td)
     m_temp = METARParser.TEMP_REGEX.search(metar_str)
     if m_temp:
       t_raw, td_raw = m_temp.group(1), m_temp.group(2)
-      data["temp_c"] = (
-          -int(t_raw[1:]) if t_raw.startswith("M") else int(t_raw)
-      )
-      data["dew_c"] = (
-          -int(td_raw[1:]) if td_raw.startswith("M") else int(td_raw)
-      )
+      data["temp_c"] = -int(t_raw[1:]) if t_raw.startswith("M") else int(t_raw)
+      data["dew_c"] = -int(td_raw[1:]) if td_raw.startswith("M") else int(td_raw)
 
     # 7. Parse Tekanan Altimeter (QNH)
     m_qnh = METARParser.QNH_REGEX.search(metar_str)
@@ -142,22 +137,27 @@ class ACSGenerator:
     self.db_path = db_path
 
   def fetch_monthly_metars(self, year: int, month: int) -> pd.DataFrame:
-    """Mengambil dan mem-parsing seluruh encoded_metar dari station_me48.db."""
+    """Mengambil sandi buletin dari metar_logs (termasuk .00 dan .30) dan mem-parsing isinya."""
     month_str = f"{year:04d}-{month:02d}%"
     with sqlite3.connect(self.db_path) as conn:
       query = """
-                SELECT data_timestamp, encoded_metar 
-                FROM me48_observations 
-                WHERE data_timestamp LIKE ? 
-                  AND encoded_metar IS NOT NULL 
-                  AND encoded_metar != ''
-                ORDER BY data_timestamp ASC
+                SELECT bulletin_timestamp as data_timestamp, metar_code 
+                FROM metar_logs 
+                WHERE bulletin_timestamp LIKE ? 
+                  AND metar_code IS NOT NULL 
+                  AND metar_code != ''
+                ORDER BY bulletin_timestamp ASC
             """
       raw_df = pd.read_sql_query(query, conn, params=[month_str])
 
     parsed_records = []
     for _, row in raw_df.iterrows():
-      parsed = METARParser.parse(row["encoded_metar"])
+      # Jika metar_code di log murni sandi tapi tidak ada prefix "METAR", paksa prefix untuk parser
+      m_text = row["metar_code"].strip()
+      if not m_text.startswith("METAR") and not m_text.startswith("SPECI"):
+        m_text = f"METAR WAGB {m_text}"
+        
+      parsed = METARParser.parse(m_text)
       if parsed:
         parsed["timestamp"] = row["data_timestamp"]
         parsed_records.append(parsed)
@@ -201,8 +201,6 @@ class ACSGenerator:
         index=directions, columns=brackets, fill_value=0
     )
     ct["Total"] = ct.sum(axis=1)
-
-    # Persentase total observasi
     pct = (ct / len(df) * 100).round(2)
     return pct
 
@@ -366,6 +364,5 @@ def generate_full_acs(year: int, month: int, export_excel: bool = True):
 
 
 if __name__ == "__main__":
-  # Contoh: Membuat laporan ACS untuk bulan berjalan
   now = datetime.now()
   generate_full_acs(year=now.year, month=now.month, export_excel=True)

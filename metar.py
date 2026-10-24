@@ -1,7 +1,7 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import math
 import re
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 
 # =============================================================================
@@ -351,3 +351,34 @@ def convert_synop_to_metar_peraturan(
   return encoded_metar, bulletin_with_header
 
 translate_ww_to_metar = convert_ww_to_metar
+
+def get_safe_metar_iso_timestamp(
+    metar_text: str, obs_date_obj: datetime.date
+) -> str:
+  match = re.search(r"\b(\d{2})(\d{2})(\d{2})Z\b", metar_text)
+  if not match:
+    # Fallback jika sandi tidak memiliki grup waktu standar
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:00Z")
+
+  day = int(match.group(1))
+  hour = int(match.group(2))
+  minute = int(match.group(3))
+
+  year = obs_date_obj.year
+  month = obs_date_obj.month
+
+  # Penyesuaian jika terjadi pergantian bulan
+  if obs_date_obj.day >= 28 and day == 1:
+    if month == 12:
+      month = 1
+      year += 1
+    else:
+      month += 1
+  elif obs_date_obj.day == 1 and day >= 28:
+    if month == 1:
+      month = 12
+      year -= 1
+    else:
+      month -= 1
+
+  return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:00Z"

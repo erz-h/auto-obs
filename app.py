@@ -1,16 +1,10 @@
-import os
 from datetime import date, datetime, timezone
+import json
+import os
 from dotenv import load_dotenv
+import numpy as np
+import pandas as pd
 import streamlit as st
-from autopilot_engine import BMKGAutopilot
-from data_manager import render_data_manager
-from data_model import (
-    STATION_LAT,
-    STATION_LON,
-    fetch_hybrid_ensemble_forecast,
-    get_current_synoptic_target,
-    parse_ensemble_hourly_table,
-)
 
 # Custom Internal Modules
 from api_client import (
@@ -20,8 +14,21 @@ from api_client import (
     get_api_headers,
     submit_observation_entry,
 )
-from auth import get_bmkg_credentials
-from db import get_historical_records, save_local_observation
+from auth import get_bmkg_credentials, is_jwt_expired, load_stored_tokens
+from autopilot_engine import BMKGAutopilot
+from data_manager import compute_pan_evaporation, render_data_manager
+from data_model import (
+    STATION_LAT,
+    STATION_LON,
+    fetch_hybrid_ensemble_forecast,
+    get_current_synoptic_target,
+    parse_ensemble_hourly_table,
+)
+from db import (
+    log_metar_bulletin,
+    save_local_observation,
+    save_pan_evaporation_record,
+)
 from dict import (
     CLOUD_COVER_OKTAS,
     CLOUD_DIRECTION,
@@ -35,7 +42,7 @@ from dict import (
     PAST_WEATHER_W,
     PRESENT_WEATHER_WW,
 )
-from metar import convert_synop_to_metar_peraturan
+from metar import convert_synop_to_metar_peraturan, get_safe_metar_iso_timestamp
 from weather_utils import (
     apply_sky_condition_rules,
     derive_dew_point,
@@ -49,44 +56,122 @@ DEFAULT_USER = os.getenv("BMKG_USERNAME", "96595")
 DEFAULT_PASS = os.getenv("BMKG_PASSWORD", "opr96595")
 
 OBSERVER_ROSTER = {
-    "Emir Hazam": 5882,
-    "Dhimaz": 2273,
-    "Adrian": 6480,
+    "Adrian Renaldi R": 6480,
+    "Arief Fansius": 6479,
+    "Ayu Vista": 2276,
+    "Destion Fajar P.": 5881,
+    "Dhimaz Bhaskara": 2273,
+    "Emir Hazam FH": 5882,
+    "Ivan Auyudy": 531,
+    "Martua V. Putra": 5880,
+    "Nelly Handayani": 2278,
+    "Qomar Maulidi": 528,
+    "Reni Susilowati": 532,
+    "Renysa Lidiano": 2274,
+    "Rovin Mahardika": 5883,
+    "Sulia Mulia": 524,
+    "Sunardi": 513,
     "Other / Custom ID": None,
 }
 
-st.set_page_config(page_title="BMKG Station ME 48 Entry", layout="wide")
-st.title("Station ME 48 Observation & BMKGSoft Sync")
+st.set_page_config(
+    page_title="BMKG WAGB (96655) - Muara Teweh",
+    page_icon="🌤️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# --- CSS INJECTION ---
+st.markdown(
+    """
+    <style>
+    h1, h2, h3, h4 {
+        font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+        font-weight: 600;
+        letter-spacing: -0.3px;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.35rem !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.82rem !important;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    [data-testid="stSidebar"] [data-testid="stMetricValue"] {
+        font-size: 1.12rem !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stMetricDelta"] {
+        font-size: 0.78rem !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stMetricLabel"] {
+        font-size: 0.8rem !important;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 8px 16px;
+        border-radius: 6px;
+        font-weight: 500;
+    }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
 
 # --- SIDEBAR: AUTHORIZATION ---
 st.sidebar.header("Station Authorization")
-if "bearer_token" not in st.session_state:
-  st.session_state["bearer_token"] = ""
-if "cf_clearance" not in st.session_state:
-  st.session_state["cf_clearance"] = ""
 
+# 1. Inisialisasi token dari penyimpanan lokal jika session_state masih kosong
+if "bearer_token" not in st.session_state or not st.session_state["bearer_token"]:
+  cached_token, cached_cookie = load_stored_tokens()
+  st.session_state["bearer_token"] = cached_token
+  st.session_state["cf_clearance"] = cached_cookie
+
+# 2. Definisikan input username & password
 st_user = st.sidebar.text_input("BMKG Username", value=DEFAULT_USER)
 st_pass = st.sidebar.text_input(
     "BMKG Password", value=DEFAULT_PASS, type="password"
 )
 
-if st.sidebar.button("🔑 Auto-Fetch Session Tokens"):
-  if not st_user or not st_pass:
-    st.sidebar.error("Masukkan Username dan Password BMKG.")
-  else:
-    with st.sidebar.status(
-        "Logging in ke BMKGSoft...", expanded=True
-    ) as status:
+# 3. Indikator status sesi
+token_aktif = st.session_state.get("bearer_token", "")
+if token_aktif and not is_jwt_expired(token_aktif):
+  st.sidebar.success("🟢 Sesi Aktif (Tersimpan Lokal)")
+else:
+  st.sidebar.warning("🔴 Sesi Kedaluwarsa / Belum Login")
+
+col_auth1, col_auth2 = st.sidebar.columns(2)
+
+with col_auth1:
+  if st.button("🔄 Validasi", use_container_width=True):
+    with st.sidebar.status("Memeriksa sesi...", expanded=True) as status:
       try:
-        token, cookie = get_bmkg_credentials(st_user, st_pass, headless=False)
-        if not token:
-          raise ValueError("Token kosong. Periksa koneksi atau kredensial.")
-        st.session_state["bearer_token"] = token
-        st.session_state["cf_clearance"] = cookie or ""
-        status.update(label="Token berhasil diambil!", state="complete")
+        t, c = get_bmkg_credentials(
+            st_user, st_pass, headless=True, force_refresh=False
+        )
+        st.session_state["bearer_token"] = t
+        st.session_state["cf_clearance"] = c or ""
+        status.update(label="Sesi valid!", state="complete")
         st.rerun()
-      except Exception as err:
-        status.update(label=f"Gagal: {err}", state="error")
+      except Exception as e:
+        status.update(label=f"Gagal: {e}", state="error")
+
+with col_auth2:
+  if st.button("🔑 Login Baru", use_container_width=True):
+    with st.sidebar.status("Login ulang BMKGSoft...", expanded=True) as status:
+      try:
+        t, c = get_bmkg_credentials(
+            st_user, st_pass, headless=False, force_refresh=True
+        )
+        st.session_state["bearer_token"] = t
+        st.session_state["cf_clearance"] = c or ""
+        status.update(label="Token baru disimpan!", state="complete")
+        st.rerun()
+      except Exception as e:
+        status.update(label=f"Gagal: {e}", state="error")
 
 BEARER_TOKEN = st.sidebar.text_input(
     "Bearer Token", value=st.session_state["bearer_token"], type="password"
@@ -98,30 +183,11 @@ CF_CLEARANCE = st.sidebar.text_input(
 )
 REQ_HEADERS = get_api_headers(BEARER_TOKEN, CF_CLEARANCE)
 
-# ==============================================================================
-# SIDEBAR: MODEL & LIVE FORECAST
-# ==============================================================================
+# --- SIDEBAR: MODEL & LIVE FORECAST ---
 with st.sidebar:
-  # CSS untuk memperkecil seluruh metric khusus di dalam sidebar
-  st.markdown(
-      """
-        <style>
-        [data-testid="stSidebar"] [data-testid="stMetricValue"] {
-            font-size: 1.15rem !important;
-        }
-        [data-testid="stSidebar"] [data-testid="stMetricDelta"] {
-            font-size: 0.8rem !important;
-        }
-        [data-testid="stSidebar"] [data-testid="stMetricLabel"] {
-            font-size: 0.85rem !important;
-        }
-        </style>
-    """,
-      unsafe_allow_html=True,
-  )
-
+  st.markdown("---")
   st.header("📊 Live Forecast")
-  st.subheader("Model Hibrida Saat Ini")
+  st.subheader("Model Hibrida WAGB")
   st.caption(
       "Kombinasi ICON (60%) + GEM (40%) untuk TT, ECMWF untuk Td & Baro."
   )
@@ -133,12 +199,9 @@ with st.sidebar:
       current_obs = get_current_synoptic_target(df_fc)
 
       col_m1, col_m2 = st.columns(2)
-
-      # Baris 1: Suhu & Kelembapan
       col_m1.metric("Suhu (TT)", f"{current_obs['tt_c']} °C")
       col_m2.metric("Kelembapan", f"{int(round(current_obs['rh_pc']))} %")
 
-      # Baris 2: Dew Point / Wet Bulb & Tekanan
       col_m1.metric(
           "Titik Embun",
           f"{current_obs['td_c']} °C",
@@ -146,15 +209,13 @@ with st.sidebar:
           delta_color="off",
       )
       col_m2.metric(
-          "Tekanan (hPa)",
+          "Tekanan (QFF)",
           f"{current_obs['qff_mb']}",
           f"QFE: {current_obs['qfe_mb']}",
           delta_color="off",
       )
   except Exception as e:
-    st.warning(f"Gagal memuat preview model langsung: {e}")
-  except Exception as e:
-    st.warning(f"Gagal memuat preview model langsung: {e}")
+    st.warning(f"Gagal memuat preview model: {e}")
 
 if "autopilot" not in st.session_state:
   st.session_state.autopilot = None
@@ -166,11 +227,11 @@ is_running = (
 
 st.title("Stasiun Meteorologi WAGB (96655) - Muara Teweh")
 
-# Inisialisasi 3 Tab Utama
-tab_input, tab_autopilot, tab_db = st.tabs([
+tab_input, tab_autopilot, tab_evap, tab_db_reports = st.tabs([
     "📝 Input Manual (ME-48 / SYNOP)",
     "🛰️ Autopilot Controller",
-    "🗄️ Database ME-48 & Bulletin",
+    "🪣 Helper Evaporasi",
+    "🗄️ Database & Pelaporan Iklim",
 ])
 
 # ==============================================================================
@@ -202,7 +263,6 @@ with tab_input:
         else raw_id
     )
 
-
   # --- SECTION 2: WIND, WEATHER, PRESSURE & TEMPERATURE ---
   st.subheader("2. Angin, Cuaca, Tekanan & Suhu")
   col_angin, col_cuaca, col_tekanan, col_suhu = st.columns(4)
@@ -218,7 +278,6 @@ with tab_input:
     wind_speed = st.number_input(
         "Kecepatan Angin (knot)", min_value=0, value=None
     )
-    st.write("")
     visibility = st.number_input(
         "Jarak Pandang Mendatar (km)", min_value=0.0, value=None, format="%.1f"
     )
@@ -265,7 +324,6 @@ with tab_input:
     temp_min = st.number_input(
         "Suhu Minimum (°C)", value=None, placeholder="Opsional"
     )
-
 
   # --- SECTION 3: CLOUDS & PRECIPITATION ---
   st.subheader("3. Weather & Detailed Cloud Observation")
@@ -462,7 +520,6 @@ with tab_input:
           format_func=lambda x: CLOUD_DIRECTION.get(x, ""),
       )
 
-
   # --- SECTION 4: EVAPORATION, SUNSHINE & SOIL ---
   st.subheader("4. Penguapan, Matahari & Tanah")
   col_evap, col_sun, col_land = st.columns(3)
@@ -493,13 +550,11 @@ with tab_input:
     )
     land_note = st.text_input("Catatan Tanah", value="")
 
-
   # --- SECTION 5: GENERATOR & GTS BROADCAST CENTER ---
   st.markdown("---")
   st.subheader("5. Sandi SYNOP & METAR Generator")
 
-
-  def generate_codes_from_form():
+  def generate_codes_from_form(update_widgets: bool = True):
     """Coordinates payload construction, server preview call, and METAR synthesis."""
     hour_int = int(obs_hour.split(":")[0])
     iso_utc_timestamp = f"{obs_date.strftime('%Y-%m-%d')}T{hour_int:02d}:00:00Z"
@@ -539,15 +594,9 @@ with tab_input:
         "cloud_low_base_3": cloud_low_base_3,
         "cloud_low_peak_1": cloud_low_peak_1,
         "cloud_low_peak_2": cloud_low_peak_2,
-        "cloud_low_dir_1": int(cloud_low_dir_1)
-        if cloud_low_dir_1 is not None
-        else None,
-        "cloud_low_dir_2": int(cloud_low_dir_2)
-        if cloud_low_dir_2 is not None
-        else None,
-        "cloud_low_dir_3": int(cloud_low_dir_3)
-        if cloud_low_dir_3 is not None
-        else None,
+        "cloud_low_dir_1": int(cloud_low_dir_1) if cloud_low_dir_1 is not None else None,
+        "cloud_low_dir_2": int(cloud_low_dir_2) if cloud_low_dir_2 is not None else None,
+        "cloud_low_dir_3": int(cloud_low_dir_3) if cloud_low_dir_3 is not None else None,
         "cloud_elevation_angle_ec_1": cloud_elevation_angle_ec_1,
         "cloud_elevation_angle_ec_2": cloud_elevation_angle_ec_2,
         "cloud_low_dir_true_da_1": cloud_low_dir_true_da_1,
@@ -560,12 +609,8 @@ with tab_input:
         "cloud_med_cover_2": str(cloud_med_cover_2 or ""),
         "cloud_med_base_1": cloud_med_base_1,
         "cloud_med_base_2": cloud_med_base_2,
-        "cloud_med_dir_1": int(cloud_med_dir_1)
-        if cloud_med_dir_1 is not None
-        else None,
-        "cloud_med_dir_2": int(cloud_med_dir_2)
-        if cloud_med_dir_2 is not None
-        else None,
+        "cloud_med_dir_1": int(cloud_med_dir_1) if cloud_med_dir_1 is not None else None,
+        "cloud_med_dir_2": int(cloud_med_dir_2) if cloud_med_dir_2 is not None else None,
         "cloud_high_type_ch": cloud_high_type_ch,
         "cloud_high_cover_oktas": cloud_high_cover_oktas,
         "cloud_high_type_1": cloud_high_type_1,
@@ -574,12 +619,8 @@ with tab_input:
         "cloud_high_cover_2": str(cloud_high_cover_2 or ""),
         "cloud_high_base_1": cloud_high_base_1,
         "cloud_high_base_2": cloud_high_base_2,
-        "cloud_high_dir_1": int(cloud_high_dir_1)
-        if cloud_high_dir_1 is not None
-        else None,
-        "cloud_high_dir_2": int(cloud_high_dir_2)
-        if cloud_high_dir_2 is not None
-        else None,
+        "cloud_high_dir_1": int(cloud_high_dir_1) if cloud_high_dir_1 is not None else None,
+        "cloud_high_dir_2": int(cloud_high_dir_2) if cloud_high_dir_2 is not None else None,
         "solar_rad_24h_jcm2_f24": solar_rad_24h_jcm2_f24,
         "sunshine_h_sss": sunshine_h_sss,
         "evaporation_24hours_mm_eee": evaporation_24hours_mm_eee,
@@ -589,7 +630,7 @@ with tab_input:
     }
     apply_sky_condition_rules(payload, cloud_cover_oktas_m)
 
-    # 1. Fetch SYNOP from Preview
+    # 1. Fetch SYNOP dari Preview
     with st.spinner("Mengambil kalkulasi & sandi SYNOP dari BMKGSoft..."):
       calc_data, official_synop, code, err_msg = fetch_preview_calculations(
           payload, iso_utc_timestamp, REQ_HEADERS
@@ -643,19 +684,26 @@ with tab_input:
     except Exception as err:
       raw_metar, wmo_bulletin = "", f"Gagal generate METAR: {err}"
 
-    # 4. Bind directly to widget state
-    st.session_state["gts_synop_text"] = official_synop
-    st.session_state["gts_metar_text"] = wmo_bulletin
+    # Simpan ke internal state
     st.session_state["latest_synop_code"] = official_synop
     st.session_state["latest_metar_code"] = raw_metar
     st.session_state["latest_calc_data"] = calc_data
     st.session_state["latest_payload"] = payload
     st.session_state["latest_iso_ts"] = iso_utc_timestamp
+
+    if update_widgets:
+      st.session_state["gts_synop_text"] = official_synop
+      st.session_state["gts_metar_text"] = wmo_bulletin
+
     st.toast("✅ Sandi SYNOP & METAR berhasil digenerate!", icon="⚡")
+    return payload, calc_data, official_synop, raw_metar, wmo_bulletin, iso_utc_timestamp
 
-
-  if st.button("⚡ Generate Sandi (SYNOP & METAR)", type="primary", use_container_width=True):
-    generate_codes_from_form()
+  if st.button(
+      "⚡ Generate Sandi (SYNOP & METAR)",
+      type="primary",
+      use_container_width=True,
+  ):
+    generate_codes_from_form(update_widgets=True)
 
   if "gts_synop_text" not in st.session_state:
     st.session_state["gts_synop_text"] = ""
@@ -665,56 +713,107 @@ with tab_input:
   tab_synop, tab_metar = st.tabs(["Sandi SYNOP Resmi", "Generator METAR (WAGB)"])
 
   with tab_synop:
-    synop_to_send = st.text_area(
+    synop_area = st.text_area(
         "Sandi SYNOP (Ready to Broadcast)",
         key="gts_synop_text",
         height=130,
-        placeholder="Klik tombol '⚡ Generate Sandi' di atas untuk membuat sandi AAXX otomatis...",
+        placeholder="Klik tombol '⚡ Generate Sandi' di atas...",
     )
     if st.button("🚀 Broadcast SYNOP ke GTS"):
-      success, msg = broadcast_to_gts(synop_to_send, REQ_HEADERS)
-      if success:
-        st.success(f"✅ {msg}")
+      text_synop = st.session_state.get("gts_synop_text", "")
+      if not text_synop:
+        st.error("Teks SYNOP kosong. Klik generate terlebih dahulu.")
       else:
-        st.error(f"❌ {msg}")
+        success, msg = broadcast_to_gts(text_synop, REQ_HEADERS)
+        if success:
+          st.success(f"✅ {msg}")
+        else:
+          st.error(f"❌ {msg}")
 
   with tab_metar:
-    metar_to_send = st.text_area(
+    metar_area = st.text_area(
         "Sandi METAR",
         key="gts_metar_text",
         height=130,
-        placeholder="Klik tombol '⚡ Generate Sandi' di atas untuk membuat sandi METAR...",
+        placeholder="Klik tombol '⚡ Generate Sandi' di atas...",
     )
     if st.button("🚀 Broadcast METAR ke GTS"):
-      success, msg = broadcast_to_gts(metar_to_send, REQ_HEADERS)
-      if success:
-        st.success(f"✅ {msg}")
+      text_metar = st.session_state.get("gts_metar_text", "")
+      if not text_metar:
+        st.error("Teks METAR kosong. Klik generate terlebih dahulu.")
       else:
-        st.error(f"❌ {msg}")
+        target_ts = get_safe_metar_iso_timestamp(text_metar, obs_date)
+        success, msg = broadcast_to_gts(text_metar, REQ_HEADERS)
 
+        log_metar_bulletin(
+            bulletin_ts=target_ts,
+            metar_code=text_metar.strip().split("\n")[-1],
+            wmo_bulletin=text_metar,
+            sent_status=1 if success else 0,
+            station_icao="WAGB",
+        )
+
+        if success:
+          st.success(f"✅ {msg} (Tersimpan sebagai `{target_ts}` di `metar_logs`)")
+        else:
+          st.error(f"❌ {msg} (Gagal siar, tercatat sebagai status 0)")
 
   # --- SECTION 6: SUBMIT & COMMIT TO BMKGSOFT & SQLITE ---
   st.markdown("---")
   st.subheader("6. Simpan ke Database & Submit BMKGSoft")
-  submit_btn = st.button("💾 Simpan Lokal & Submit BMKGSoft", use_container_width=True)
+
+  if "latest_payload" in st.session_state and st.session_state["latest_payload"]:
+    with st.expander(
+        "🔍 Live Inspector: Outgoing Payload (Klik untuk melihat)", expanded=False
+    ):
+      st.caption("Payload JSON yang telah dirakit dan siap dikirim ke BMKGSoft:")
+      st.json(st.session_state["latest_payload"])
+
+  submit_btn = st.button(
+      "💾 Simpan Lokal & Submit BMKGSoft", use_container_width=True
+  )
 
   if submit_btn:
-    if not st.session_state.get("gts_synop_text"):
-      generate_codes_from_form()
+    (
+        payload,
+        calc_data,
+        official_synop,
+        current_metar,
+        wmo_bulletin,
+        iso_utc_timestamp,
+    ) = generate_codes_from_form(update_widgets=False)
 
-    iso_utc_timestamp = st.session_state.get(
-        "latest_iso_ts",
-        f"{obs_date.strftime('%Y-%m-%d')}T{int(obs_hour.split(':')[0]):02d}:00:00Z",
-    )
     hour_int = int(obs_hour.split(":")[0])
-    payload = st.session_state.get("latest_payload", {})
-    calc_data = st.session_state.get("latest_calc_data", {})
-    official_synop = st.session_state.get("gts_synop_text", "")
-    current_metar = st.session_state.get("latest_metar_code", "")
+    synop_input = st.session_state.get("gts_synop_text", "")
+    final_synop = synop_input.strip() if synop_input and synop_input.strip() else official_synop
+    final_metar = current_metar if current_metar else st.session_state.get("latest_metar_code", "")
+
+    print("\n" + "=" * 60)
+    print(f"[DEBUG SUBMIT] Timestamp : {iso_utc_timestamp} (Hour: {hour_int})")
+    print("[DEBUG SUBMIT] Outgoing Payload:")
+    print(json.dumps(payload, indent=2, default=str))
+    print("=" * 60 + "\n")
 
     is_success, status_code, resp_text = submit_observation_entry(
         payload, iso_utc_timestamp, hour_int, REQ_HEADERS
     )
+
+    with st.expander(
+        f"🛠️ Debug Console — HTTP Status: {status_code}", expanded=not is_success
+    ):
+      col_req, col_res = st.columns(2)
+      with col_req:
+        st.markdown("**Payload Dikirim (`request.body`):**")
+        st.json(payload)
+      with col_res:
+        st.markdown(f"**Respon Server (`HTTP {status_code}`):**")
+        try:
+          parsed_res = json.loads(resp_text)
+          st.json(parsed_res)
+        except Exception:
+          st.code(
+              resp_text or "<Badan respons kosong / Empty body>", language="text"
+          )
 
     combined_record = {
         **payload,
@@ -725,25 +824,27 @@ with tab_input:
     if is_success:
       save_local_observation(
           combined_record,
-          encoded_synop=official_synop,
-          encoded_metar=current_metar,
+          encoded_synop=final_synop,
+          encoded_metar=final_metar,
           synced=1,
       )
       st.balloons()
-      st.success("✅ Terkirim ke BMKGSoft & tersimpan lengkap di SQLite!")
+      st.success(
+          f"✅ Terkirim ke BMKGSoft (Status {status_code}) & tersimpan lengkap di SQLite!"
+      )
     else:
       save_local_observation(
           combined_record,
-          encoded_synop=official_synop,
-          encoded_metar=current_metar,
+          encoded_synop=final_synop,
+          encoded_metar=final_metar,
           synced=0,
       )
-      st.warning(
-          f"⚠️ Gagal kirim ({status_code}). Data tersimpan di SQLite (synced=0)."
+      st.error(
+          f"⚠️ Gagal kirim ke BMKGSoft (HTTP {status_code}). Detail kegagalan terlihat pada Debug Console di atas."
       )
 
 # ==============================================================================
-# TAB 2: AUTOPILOT CONTROLLER (Khusus Menjalankan Engine Otomatis)
+# TAB 2: AUTOPILOT CONTROLLER
 # ==============================================================================
 with tab_autopilot:
   st.subheader("Kontrol Operasional Autopilot")
@@ -753,11 +854,11 @@ with tab_autopilot:
   with col_ctrl:
     with st.container(border=True):
       st.markdown("### Eksekusi Engine")
-      st.write("Jadwal Transmisi:")
+      st.write("Jadwal Transmisi Terjadwal:")
       st.markdown("""
-            * **ME-48**: Tiap jam (menit `:00`)
+            * **ME-48**: Tiap jam bulat (menit `:00` UTC)
             * **SEND GTS**: Jam sinoptik (`00, 03, 06... UTC`)
-            * **METAR**: Tiap 30 menit (menit `:30` dan `:00`)
+            * **METAR**: Tiap 30 menit (menit `:00` & `:30` UTC)
             """)
 
       btn_start = st.button(
@@ -773,7 +874,7 @@ with tab_autopilot:
       )
 
       if btn_start:
-        st.session_state.autopilot = BMKGAutopilot(api_client=None)
+        st.session_state.autopilot = BMKGAutopilot()
         st.session_state.autopilot.start()
         st.rerun()
 
@@ -782,14 +883,50 @@ with tab_autopilot:
           st.session_state.autopilot.stop()
         st.rerun()
 
+      st.markdown("---")
+      # Tombol uji coba manual
+      btn_test_now = st.button(
+          "⚡ Trigger Kirim Sekarang (Uji Coba)",
+          use_container_width=True,
+          disabled=not is_running,
+          help=(
+              "Jalankan siklus transmisi ME-48 & METAR sekarang juga tanpa"
+              " menunggu menit :00/:30."
+          ),
+      )
+
+      if btn_test_now and st.session_state.autopilot:
+        with st.spinner("Mengeksekusi transmisi autopilot uji coba..."):
+          now_test = datetime.now(timezone.utc)
+          test_min = 0 if now_test.minute < 30 else 30
+
+          if test_min == 0:
+            # Siklus jam bulat: Kirim ME-48 + METAR :00
+            p, _ = st.session_state.autopilot._execute_hourly_observation(
+                now_test, now_test.hour
+            )
+            st.session_state.autopilot._execute_metar_transmission(
+                now_test, now_test.hour, 0, prebuilt_payload=p
+            )
+          else:
+            # Siklus setengah jam: Khusus buletin METAR :30 saja
+            st.session_state.autopilot._execute_metar_transmission(
+                now_test, now_test.hour, 30
+            )
+
+        st.success(
+            f"✅ Uji coba transmisi (menit :{test_min:02d}) selesai! Cek tab"
+            " database untuk verifikasi."
+        )
+        st.rerun()
+
   with col_status:
     with st.container(border=True):
       st.markdown("### Status Engine Aktif")
       if is_running:
         st.success("🟢 **AUTOPILOT RUNNING**: Worker thread aktif di background")
         last_me48 = (
-            st.session_state.autopilot.last_me48_sent
-            or "Menunggu menit :00..."
+            st.session_state.autopilot.last_me48_sent or "Menunggu menit :00..."
         )
         last_metar = (
             st.session_state.autopilot.last_metar_sent
@@ -802,6 +939,9 @@ with tab_autopilot:
         st.error("🔴 **AUTOPILOT STOPPED / IDLE**")
         st.caption("Engine tidak berjalan. Tidak ada data yang dikirim.")
 
+      if st.button("🔄 Refresh Status", use_container_width=True):
+        st.rerun()
+
   with st.expander("ℹ️ Detail Logika Autopilot Terpasang", expanded=False):
     st.markdown("""
         1. **Carry-Over Otomatis:** Mengambil template visual (awan & jarak pandang) dari record `me48_observations` terakhir di `station_me48.db`.
@@ -811,7 +951,123 @@ with tab_autopilot:
         """)
 
 # ==============================================================================
-# TAB 3: DATABASE ME-48 & BULLETIN INSPECTION (Riwayat Penyimpanan SQLite)
+# TAB 3: HELPER EVAPORASI PANCI TERBUKA
 # ==============================================================================
-with tab_db:
-    render_data_manager()
+with tab_evap:
+  st.subheader("🪣 Helper Pengukuran Panci Evaporasi")
+  st.caption(
+      "Perhitungan Beda Tinggi (H) dan Evaporasi Harian (E = H + R <= 7.0) dengan"
+      " Penyimpanan SQLite"
+  )
+
+  today_dt = datetime.now()
+  c_ev1, c_ev2, c_ev3 = st.columns(3)
+  with c_ev1:
+    ev_year = st.number_input(
+        "Tahun", min_value=2020, max_value=2030, value=today_dt.year, key="ev_thn"
+    )
+  with c_ev2:
+    ev_month = st.selectbox(
+        "Bulan",
+        range(1, 13),
+        index=today_dt.month - 1,
+        format_func=lambda m: datetime(2000, m, 1).strftime("%B"),
+        key="ev_bln",
+    )
+  with c_ev3:
+    ev_init_s2 = st.number_input(
+        "Skala 2 Akhir Bulan Lalu", value=20.0, step=0.1, format="%.1f"
+    )
+
+  days_in_month = pd.Period(f"{ev_year}-{ev_month}").days_in_month
+  default_ev_df = pd.DataFrame({
+      "TGL": range(1, days_in_month + 1),
+      "scale_1": [np.nan] * days_in_month,
+      "scale_2": [20.0] * days_in_month,
+      "rainfall_r": [0.0] * days_in_month,
+  })
+
+  edited_ev_df = st.data_editor(
+      default_ev_df,
+      column_config={
+          "TGL": st.column_config.NumberColumn("TGL", disabled=True),
+          "scale_1": st.column_config.NumberColumn(
+              "Skala 1 (Isikan)", step=0.1, format="%.1f"
+          ),
+          "scale_2": st.column_config.NumberColumn(
+              "Skala 2 (Ganti Air)", step=0.1, format="%.1f"
+          ),
+          "rainfall_r": st.column_config.NumberColumn(
+              "Hujan R (mm)", step=0.1, format="%.1f"
+          ),
+      },
+      hide_index=True,
+      use_container_width=True,
+  )
+
+  if st.button(
+      "Hitung & Simpan Evaporasi ke Database",
+      type="primary",
+      use_container_width=True,
+  ):
+    ev_res = compute_pan_evaporation(
+        edited_ev_df, prev_month_last_scale2=ev_init_s2
+    )
+
+    saved_count = 0
+    for _, row in ev_res.iterrows():
+      if pd.notnull(row["scale_1"]) or pd.notnull(row["evaporation_ev"]):
+        date_str = f"{ev_year}-{ev_month:02d}-{int(row['TGL']):02d}"
+        save_pan_evaporation_record(
+            obs_date=date_str,
+            scale_1=float(row["scale_1"]) if pd.notnull(row["scale_1"]) else None,
+            scale_2=float(row["scale_2"]) if pd.notnull(row["scale_2"]) else 20.0,
+            diff_h=float(row["diff_h"]) if pd.notnull(row["diff_h"]) else None,
+            rainfall_r=(
+                float(row["rainfall_r"])
+                if pd.notnull(row["rainfall_r"])
+                else 0.0
+            ),
+            evaporation_ev=(
+                float(row["evaporation_ev"])
+                if pd.notnull(row["evaporation_ev"])
+                else None
+            ),
+        )
+        saved_count += 1
+
+    st.success(
+        f"✅ Perhitungan selesai & {saved_count} rekaman tersimpan di tabel"
+        " `pan_evaporation`!"
+    )
+    st.dataframe(
+        ev_res[[
+            "TGL",
+            "scale_1",
+            "scale_2",
+            "diff_h",
+            "rainfall_r",
+            "evaporation_ev",
+        ]],
+        column_config={
+            "diff_h": st.column_config.NumberColumn(
+                "H (Beda Tinggi)", format="%.1f"
+            ),
+            "evaporation_ev": st.column_config.NumberColumn(
+                "EV (E=H+R)", format="%.1f"
+            ),
+        },
+        use_container_width=True,
+    )
+    st.download_button(
+        "📥 Unduh CSV Evaporasi",
+        ev_res.to_csv(index=False).encode("utf-8"),
+        f"evaporasi_{ev_year}_{ev_month:02d}.csv",
+        "text/csv",
+    )
+
+# ==============================================================================
+# TAB 4: DATABASE & PELAPORAN IKLIM
+# ==============================================================================
+with tab_db_reports:
+  render_data_manager()
